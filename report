@@ -1,0 +1,93 @@
+import os
+import feedparser
+import asyncio
+from pydantic import BaseModel, Field
+from openai import AsyncOpenAI
+from notion_client import Client
+
+# --- 設定 ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+
+notion = Client(auth=NOTION_TOKEN)
+async_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+class MarketAnalysis(BaseModel):
+    context: str = Field(description="社会的背景。専門的な日本語で。")
+    insight: str = Field(description="潜在インサイト。消費者の本音。")
+    action: str = Field(description="PRの切り口・具体的アクション。")
+    forecast: str = Field(description="今後のメディア予測キーワード。")
+
+def get_existing_urls():
+    """Notionデータベースから既に登録されているURLの一覧を取得"""
+    existing_urls = set()
+    cursor = None
+    while True:
+        response = notion.databases.query(
+            database_id=NOTION_DATABASE_ID,
+            start_cursor=cursor,
+            filter={"property": "URL", "url": {"is_not_empty": True}}
+        )
+        for page in response["results"]:
+            url = page["properties"]["URL"]["url"]
+            existing_urls.add(url)
+        
+        if not response["has_more"]:
+            break
+        cursor = response["next_cursor"]
+    return existing_urls
+
+async def analyze_article(title) -> MarketAnalysis:
+    """Geminiによる高度な戦略分析"""
+    resp = await async_client.beta.chat.completions.parse(
+        model="gpt-4o-2024-08-06",
+        messages=[
+            {"role": "system", "content": "あなたは美容業界専門の戦略コンサルタントです。ニュースタイトルから10万円の価値がある知略レポートを日本語で作成してください。"},
+            {"role": "user", "content": f"タイトル: {title}"}
+        ],
+        response_format=MarketAnalysis
+    )
+    return resp.choices[0].message.parsed
+
+def save_to_notion(title, link, report: MarketAnalysis):
+    """Notionへページを作成"""
+    notion.pages.create(
+        parent={"database_id": NOTION_DATABASE_ID},
+        properties={
+            "タイトル": {"title": [{"text": {"content": title}}]},
+            "URL": {"url": link},
+            "社会的背景": {"rich_text": [{"text": {"content": report.context}}]},
+            "潜在インサイト": {"rich_text": [{"text": {"content": report.insight}}]},
+            "PRアクション": {"rich_text": [{"text": {"content": report.action}}]},
+            "メディア予報": {"rich_text": [{"text": {"content": report.forecast}}]},
+            "承認": {"checkbox": False}
+        }
+    )
+
+async def main():
+    print("📡 リサーチ開始（Notion直結モード）...")
+    existing_urls = get_existing_urls()
+    
+    # 検索キーワード
+    keywords = ["化粧品 PR 戦略", "美容業界 トレンド", "スキンケア 悩み インサイト"]
+    
+    for kw in keywords:
+        feed_url = f"https://news.google.com/rss/search?q={kw}&hl=ja&gl=JP&ceid=JP:ja"
+        feed = feedparser.parse(feed_url)
+        
+        for entry in feed.entries[:10]:
+            if entry.link in existing_urls:
+                continue
+            
+            print(f"🔍 分析中: {entry.title[:30]}...")
+            try:
+                report = await analyze_article(entry.title)
+                save_to_notion(entry.title, entry.link, report)
+                print(f"✅ Notionへ保存完了")
+                await asyncio.sleep(1) # レート制限対策
+            except Exception as e:
+                print(f"❌ エラー: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
